@@ -22,6 +22,8 @@ import java.awt.Color;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
+import java.awt.Shape;
+import java.awt.Stroke;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.print.PageFormat;
@@ -208,11 +210,21 @@ public final class PDFPrintable implements Printable
 
         Graphics2D printerGraphics = null;
         Graphics2D graphics2D = null;
+        AffineTransform callerTransform = null;
+        Shape callerClip = null;
+        Color callerColor = null;
+        Color callerBackground = null;
+        Stroke callerStroke = null;
 
         try
         {
             printerGraphics = (Graphics2D) graphics;
             graphics2D = printerGraphics;
+            callerTransform = printerGraphics.getTransform();
+            callerClip = printerGraphics.getClip();
+            callerColor = printerGraphics.getColor();
+            callerBackground = printerGraphics.getBackground();
+            callerStroke = printerGraphics.getStroke();
 
             // capture the DPI that will be used for rasterizing the image
             // if rasterizing is specified
@@ -324,6 +336,16 @@ public final class PDFPrintable implements Printable
         }
         finally
         {
+            // restore caller's state (guarded because the cast on line above may have thrown
+            // before any state was captured)
+            if (printerGraphics != null && callerTransform != null)
+            {
+                printerGraphics.setTransform(callerTransform);
+                printerGraphics.setClip(callerClip);
+                printerGraphics.setColor(callerColor);
+                printerGraphics.setBackground(callerBackground);
+                printerGraphics.setStroke(callerStroke);
+            }
             if (graphics2D != null && graphics2D != printerGraphics)
             {
                 graphics2D.dispose();
