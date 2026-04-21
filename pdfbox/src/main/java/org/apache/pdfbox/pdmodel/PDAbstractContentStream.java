@@ -17,6 +17,7 @@
 package org.apache.pdfbox.pdmodel;
 
 import java.awt.Color;
+import java.awt.font.GlyphVector;
 import java.awt.geom.AffineTransform;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -95,6 +96,7 @@ abstract class PDAbstractContentStream implements Closeable
 
     private final Map<PDType0Font, GsubWorker> gsubWorkers = new HashMap<>();
     private final GsubWorkerFactory gsubWorkerFactory = new GsubWorkerFactory();
+    private GlyphLayoutProcessor glyphLayoutProcessor;
 
     /**
      * Create a new appearance stream.
@@ -111,6 +113,23 @@ abstract class PDAbstractContentStream implements Closeable
 
         formatDecimal.setMaximumFractionDigits(4);
         formatDecimal.setGroupingUsed(false);
+    }
+
+    /**
+     * Sets the glyph layout processor
+     * @param glyphLayoutProcessor lyph layout processor
+     */
+    public void setGlyphLayoutProcessor(GlyphLayoutProcessor glyphLayoutProcessor) {
+        this.glyphLayoutProcessor = glyphLayoutProcessor;
+        glyphLayoutProcessor.setContentStream(this);
+    }
+
+    /**
+     * Returns the glyph layout processor or null
+     * @return the glyph layout processor or null
+     */
+    public GlyphLayoutProcessor getGlyphLayoutProcessor() {
+        return glyphLayoutProcessor;
     }
 
     /**
@@ -210,8 +229,11 @@ abstract class PDAbstractContentStream implements Closeable
             {
                 LOG.info("No GSUB data found in font {}", font.getName());
             }
+            if(glyphLayoutProcessor != null)
+            {
+                glyphLayoutProcessor.setFontAndSize(type0Font, fontSize);
+            }
         }
-
         writeOperand(resources.add(font));
         writeOperand(fontSize);
         writeOperator(OperatorName.SET_FONT_AND_SIZE);
@@ -253,6 +275,37 @@ abstract class PDAbstractContentStream implements Closeable
     }
 
     /**
+     * Show the given glyphs at the specofierd positions
+     * @param glyphsAndPositions List of glyphs and positions
+     * @throws IOException if en IO-error occurs
+     */
+    public void showGlyphsWithPositioning(GlyphsAndPositions glyphsAndPositions) throws IOException {
+        write("[");
+
+        for (Object obj : glyphsAndPositions.toArray()) {
+            if (obj instanceof GlyphsAndPositions.GlyphSubList) {
+                GlyphsAndPositions.GlyphSubList glyphSubList = (GlyphsAndPositions.GlyphSubList) obj;
+                int[] intGlyphArray = new int[glyphSubList.size()];
+                // Convert Type to int[]
+                for (int i = 0; i < intGlyphArray.length; i++) {
+                    intGlyphArray[i] = glyphSubList.get(i);
+                }
+                writeTextPDType0Font(intGlyphArray);
+            } else if (obj instanceof Float) {
+                writeOperand((Float) obj);
+            } else {
+                if (obj == null) {
+                    throw new NullPointerException("Argument contains null entry");
+                }
+                throw new IllegalArgumentException("Argument must consist of array of Float and GlyphsAndPositions.GlyphSubList types, not " + obj.getClass().getName());
+            }
+        }
+        write("] ");
+        writeOperator(OperatorName.SHOW_TEXT_ADJUSTED);
+    }
+
+
+    /**
      * Shows the given text at the location specified by the current text matrix.
      *
      * @param text The Unicode text to show.
@@ -261,7 +314,71 @@ abstract class PDAbstractContentStream implements Closeable
      */
     public void showText(String text) throws IOException
     {
-        showTextInternal(text);
+        PDFont font = fontStack.peek();
+        if(glyphLayoutProcessor != null && glyphLayoutProcessor.supportsFont(font))
+        {
+            glyphLayoutProcessor.showText(text);
+        } 
+          else 
+        {
+            showTextInternal(text);            
+            write(" ");
+            writeOperator(OperatorName.SHOW_TEXT);
+        }
+    }
+
+    
+    /**
+     * Outputs part of a glyphVector - only for PDType0Font 
+     *
+     * @param glyphCodes The glyph codes to write
+     *
+     * @throws IOException 
+     */
+    void writeTextPDType0Font(int[] glyphCodes) throws IOException {
+        if (!inTextMode) {
+            throw new IllegalStateException("Must call beginText() before showText()");
+        }
+        if (fontStack.isEmpty()) {
+            throw new IllegalStateException("Must call setFont() before showText()");
+        }
+        PDFont font = fontStack.peek();
+        if (!(font instanceof PDType0Font)) {
+            throw new IllegalStateException("Must be called with current font instance of PDType0Font");
+
+        }
+        PDType0Font pdType0Font = (PDType0Font) font;
+
+        // encode glyphs, update set of used glyphs
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        Set<Integer> glyphIds = new HashSet<>();
+
+        for (int glyphCode: glyphCodes) {
+            out.write(pdType0Font.encodeGlyphId(glyphCode));
+            if (glyphCode < 0xFFFF) {
+                glyphIds.add(glyphCode);
+            }
+        }
+        byte[] encodedText = out.toByteArray();
+
+        // add glyphs to subset
+        if (pdType0Font.willBeSubset()) {
+            pdType0Font.addGlyphsToSubset(glyphIds);
+        }
+        // write encoded text and the PDF operator
+        COSWriter.writeString(encodedText, outputStream);
+    }
+
+    /**
+     *
+     * @param glyphVector
+     * @param start
+     * @param end
+     * @throws IOException
+     */
+    void showTextPDType0Font(GlyphVector glyphVector, int start, int end) throws IOException {
+        int[] glyphCodes = glyphVector.getGlyphCodes(start, end - start, new int[end - start]);
+        writeTextPDType0Font(glyphCodes);
         write(" ");
         writeOperator(OperatorName.SHOW_TEXT);
     }
@@ -371,6 +488,26 @@ abstract class PDAbstractContentStream implements Closeable
         writeOperator(OperatorName.MOVE_TEXT);
     }
 
+    /**
+     * The Td operator.
+     * Move to the start of the next line, offset from the start of the current line by (tx, ty).
+     *
+     * @param tx The x translation.
+     * @param ty The y translation.
+     * @throws IOException If there is an error writing to the stream.
+     * @throws IllegalStateException If the method was not allowed to be called at this time.
+     */
+    void newLineAtOffsetBasic(float tx, float ty) throws IOException
+    {
+        if (!inTextMode)
+        {
+            throw new IllegalStateException("Error: must call beginText() before newLineAtOffset()");
+        }
+        writeOperand(tx);
+        writeOperand(ty);
+        writeOperator(OperatorName.MOVE_TEXT);
+    }
+    
     /**
      * The Tm operator. Sets the text matrix to the given values.
      * A current text matrix will be replaced with the new one.
